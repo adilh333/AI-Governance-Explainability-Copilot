@@ -1,154 +1,88 @@
 # AI Governance and Explainability Copilot
 
-A small end-to-end system that audits a predictive model for explainability
-and fairness, then uses a retrieval-augmented generation (RAG) pipeline to
-turn those technical outputs into a plain-English narrative grounded in
-summarised AI governance frameworks (EU AI Act, NIST AI RMF, and general
-human-oversight principles).
+An end-to-end tool that audits a machine learning model for fairness and explainability, then explains the results in plain English. It is built around a loan-approval model, but the underlying components work on any binary classifier and tabular dataset.
 
-## Motivation
+**Live demo:** https://ai-governance-explainability-copilot-jkhdniamzdjm9xunzcnum5.streamlit.app
 
-Organisations deploying predictive models, particularly in regulated
-contexts such as credit scoring, increasingly need to demonstrate not just
-that a model is accurate, but that its behaviour is explainable, that it
-does not produce materially different outcomes across protected groups, and
-that a human reviewer can meaningfully oversee its decisions.
+## What problem this solves
 
-This project investigates how those three concerns, explainability, fairness
-measurement, and governance-grounded communication, can be brought together
-in a single tool. The model and dataset are synthetic (a loan-approval
-classifier on generated data with a deliberately injected group-level bias),
-but the explainability, fairness, and RAG components are written to operate
-on any binary classifier and tabular dataset with minimal changes.
+Organisations that use AI to make decisions about people, such as approving loans or screening applications, increasingly need to demonstrate three things: that they can explain why the model made a given decision, that the model does not treat protected groups unfairly, and that a human can meaningfully review its behaviour. Regulations such as the EU AI Act now require this for high-risk systems.
+
+This tool automates that audit. It examines a model, measures whether it is fair across groups, explains what drives its decisions, and produces a plain-English narrative grounded in real governance frameworks so that a non-technical reviewer can understand and act on the findings.
+
+## Two views
+
+The interface has a sidebar toggle between two views, so it serves both audiences:
+
+- **Simple view** is written for non-technical reviewers and stakeholders. It opens with a clear verdict (for example, "This model has been flagged for a potential fairness concern"), translates every metric into plain language ("Group A is approved 16% more often than group B"), and avoids technical jargon.
+- **Technical view** shows the underlying SHAP values, the exact Fairlearn metrics, and the governance passages retrieved for each narrative, for users who want the detail.
+
+## How it works
+
+The tool combines four components:
+
+**1. Explainability (SHAP).** Calculates how much each feature (income, credit score, debt-to-income ratio, years employed) influences the model's decisions, both globally and for an individual applicant.
+
+**2. Fairness (Fairlearn).** Measures whether the model treats two applicant groups equally, using demographic parity difference (are approval rates similar?) and equalized odds difference (are error rates similar?). Either metric exceeding a threshold raises a flag.
+
+**3. Retrieval (RAG).** A set of plain-English summaries of governance frameworks (EU AI Act, NIST AI Risk Management Framework, and human-oversight principles) are searched using TF-IDF and cosine similarity to find the passages most relevant to the current findings.
+
+**4. Generation (Claude).** The audit findings and the retrieved governance passages are sent to the Anthropic Claude API, which writes a clear narrative for a non-technical reviewer. The prompt explicitly separates the audit data from the retrieved context so the model explains findings without inventing legal conclusions.
+
+A human-in-the-loop step lets a reviewer flag or approve generated explanations, reflecting how governance frameworks treat human oversight as an ongoing signal.
 
 ## Architecture
 
 ```
-┌─────────────────┐      ┌──────────────────────────────────────┐
-│   Streamlit      │      │              FastAPI backend           │
-│   frontend        │◄────►│                                        │
-│                   │ HTTP │  ┌────────────┐   ┌──────────────────┐ │
-│  - Overview tab   │      │  │ SHAP        │   │ Fairlearn         │ │
-│  - Applicant view │      │  │ explainer   │   │ fairness metrics  │ │
-│  - Q&A tab        │      │  └────────────┘   └──────────────────┘ │
-│  - feedback UI    │      │            │              │             │
-└──────────────────┘      │            ▼              ▼             │
-                            │     ┌─────────────────────────┐        │
-                            │     │   RAG pipeline            │        │
-                            │     │  - TF-IDF retrieval over   │        │
-                            │     │    governance docs (.md)   │        │
-                            │     │  - Claude generates         │        │
-                            │     │    grounded narrative       │        │
-                            │     └─────────────────────────┘        │
-                            └──────────────────────────────────────┘
+Streamlit frontend (streamlit_app.py)
+        |
+        | imports directly
+        v
+Backend modules (backend/)
+  - ml/explainability.py    SHAP wrapper
+  - ml/fairness.py          Fairlearn metrics
+  - rag/knowledge_base.py   TF-IDF retrieval over governance documents
+  - rag/rag_pipeline.py     Claude-based narrative generation
+  - rag/documents/          Governance framework summaries (markdown)
+  - data/                   Synthetic dataset and trained model
 ```
 
-### Why these specific design choices
+A FastAPI backend (`backend/main.py`) is retained as a reference implementation of the same logic exposed as a REST API. For the live deployment the logic runs in a single Streamlit process, since Streamlit Community Cloud runs one service.
 
-**TF-IDF retrieval instead of embeddings.** The knowledge base is a handful
-of curated markdown documents. TF-IDF + cosine similarity needs no external
-model downloads or API calls, is fully deterministic, and is easy to debug
-by printing the matched chunks. The `GovernanceKnowledgeBase` class is the
-only place that would need to change to swap this for sentence-transformer
-embeddings and a FAISS index, the rest of the pipeline (chunking interface,
-`retrieve()` signature) would stay the same.
+## The dataset
 
-**Why the prompt explicitly separates "audit data" from "retrieved context".**
-A common failure mode for RAG over policy documents is the model blending
-retrieved framing with the specific case being discussed, producing
-authoritative-sounding claims that neither source actually supports. The
-system prompt instructs the model to keep these separate and to flag its own
-limitations, which matters more in a governance context than in a typical
-RAG Q&A use case.
-
-**Why fairness flags use illustrative thresholds, not "the law".** The
-fairness module computes real metrics (demographic parity difference,
-equalized odds difference) using Fairlearn, but deliberately does not claim
-that crossing a threshold means a law has been broken. The governance
-documents make this distinction explicit, and the system prompt enforces it.
-
-**Why there's a feedback loop.** The NIST AI RMF "Manage" function and the
-human-oversight notes both treat reviewer feedback as a measurement signal in
-its own right. The `/feedback` endpoint and the Streamlit "flag this
-explanation" control are a minimal implementation of that idea, in a larger
-system this log would feed back into model or prompt review.
-
-## Project layout
-
-```
-ai-governance-copilot/
-├── backend/
-│   ├── main.py                  FastAPI app and endpoints
-│   ├── ml/
-│   │   ├── explainability.py     SHAP wrapper
-│   │   └── fairness.py           Fairlearn-based fairness report
-│   ├── rag/
-│   │   ├── knowledge_base.py     TF-IDF retrieval over governance docs
-│   │   ├── rag_pipeline.py       Claude-based narrative generation
-│   │   └── documents/            Governance framework summaries (.md)
-│   └── data/
-│       ├── generate_sample_data.py  Synthetic dataset + model training
-│       ├── loan_applications.csv    Generated dataset
-│       └── model.pkl                 Trained RandomForestClassifier
-├── frontend/
-│   └── app.py                   Streamlit dashboard
-├── .env.example
-└── README.md
-```
+The model and data are synthetic. The dataset is a generated loan-approval set with a deliberately injected bias against one group, so that the fairness component has a meaningful pattern to detect. This is a demonstration of the audit pipeline rather than a clinically or commercially validated system, and the fairness thresholds used are illustrative rather than legal determinations.
 
 ## Running locally
 
-### 1. Backend
-
 ```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
+git clone https://github.com/adilh333/AI-Governance-Explainability-Copilot.git
+cd AI-Governance-Explainability-Copilot
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# Regenerate the sample dataset and model (already included, but
-# re-running is useful if you tweak generate_sample_data.py)
-python data/generate_sample_data.py
+# Regenerate the synthetic dataset and model (optional, already included)
+python backend/data/generate_sample_data.py
 
-cp ../.env.example ../.env   # then edit .env and add your ANTHROPIC_API_KEY
-export $(grep -v '^#' ../.env | xargs)
-
-uvicorn main:app --reload --port 8000
+streamlit run streamlit_app.py
 ```
 
-### 2. Frontend
+Narrative generation requires an Anthropic API key. Set it as an environment variable or, when deploying to Streamlit Cloud, add it via the app's Secrets manager:
 
-In a second terminal:
-
-```bash
-cd frontend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
+```
+ANTHROPIC_API_KEY = "your-key-here"
 ```
 
-The dashboard will be available at `http://localhost:8501` and will talk to
-the backend at `http://localhost:8000`.
+The SHAP feature importance, fairness metrics, and per-applicant explanations all work without an API key; only the plain-English narrative generation requires it.
 
-Without an `ANTHROPIC_API_KEY` set, the SHAP and fairness analysis, charts,
-and applicant-level views all work normally; only the "explain in plain
-English" narrative generation requires the key.
+## Tech stack
 
-## Adapting this to a real dataset and model
-
-1. Replace `data/loan_applications.csv` and `data/model.pkl` with your own
-   data and a trained `scikit-learn`-compatible classifier (anything with
-   `.predict` and `.predict_proba`).
-2. Update `FEATURE_COLS` and the protected attribute name in
-   `ml/explainability.py` and `ml/fairness.py`.
-3. Add or edit the markdown files in `rag/documents/` to reflect the
-   governance frameworks relevant to your domain.
+Python, Streamlit, FastAPI, scikit-learn, SHAP, Fairlearn, Anthropic Claude API, pandas, NumPy.
 
 ## Possible extensions
 
-- Swap TF-IDF retrieval for sentence-transformer embeddings + FAISS for a
-  larger knowledge base.
-- Add authentication and per-reviewer feedback history.
-- Containerise with Docker and deploy the backend and frontend separately
-  (e.g. Render, Railway, or AWS).
-- Extend the fairness module to support multiple protected attributes
-  simultaneously and intersectional analysis.
+- Swap TF-IDF retrieval for sentence-transformer embeddings and a vector index for a larger knowledge base.
+- Support multiple protected attributes and intersectional fairness analysis.
+- Allow users to upload their own dataset and trained model.
+- Persist human-in-the-loop feedback and surface patterns over time.
